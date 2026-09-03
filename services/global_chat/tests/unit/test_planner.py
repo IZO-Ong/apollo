@@ -1,8 +1,17 @@
 """Unit tests for PlannerAgent tool execution and user-content building."""
 
+from pathlib import Path
 from unittest.mock import patch
 
-from global_chat.planner import PlannerAgent
+import global_chat.planner as planner_module
+import httpx
+import pytest
+import yaml
+from anthropic import BadRequestError
+from global_chat.planner import PlannerAgent, PlannerResult
+from global_chat.tools.tool_definitions import TOOL_DEFINITIONS, build_web_tools
+from streaming_util import STATUS_SEARCHING_WEB
+from util import ApolloError
 
 WORKFLOW_YAML = """\
 name: wf
@@ -39,6 +48,8 @@ def empty_usage() -> dict:
 
 
 class FakeToolUse:
+    type = "tool_use"
+
     def __init__(self, name: str, tool_input: dict, block_id: str = "tu_1"):
         self.name = name
         self.input = tool_input
@@ -46,14 +57,72 @@ class FakeToolUse:
 
 
 class StubStreamManager:
-    def send_thinking(self, *_args: object, **_kwargs: object) -> None:
-        pass
+    def __init__(self) -> None:
+        self.thinking: list = []
+        self.statuses: list[str] = []
+        self.text: list[str] = []
+
+    def send_thinking(self, status: object = None, *_args: object, **_kwargs: object) -> None:
+        self.thinking.append(status)
 
     def send_changes(self, *_args: object, **_kwargs: object) -> None:
         pass
 
-    def send_status(self, *_args: object, **_kwargs: object) -> None:
-        pass
+    def send_status(self, content: str = "", *_args: object, **_kwargs: object) -> None:
+        self.statuses.append(content)
+
+    def send_text(self, chunk: str) -> None:
+        self.text.append(chunk)
+
+
+class FakeTextBlock:
+    type = "text"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class FakeUsage:
+    input_tokens = 0
+    output_tokens = 0
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
+
+
+class FakeServerToolUse:
+    type = "server_tool_use"
+
+    def __init__(self, name: str, tool_input: dict, block_id: str = "srvtu_1") -> None:
+        self.name = name
+        self.input = tool_input
+        self.id = block_id
+
+
+class FakeResponse:
+    def __init__(self, stop_reason: str, content: list) -> None:
+        self.stop_reason = stop_reason
+        self.content = content
+        self.usage = FakeUsage()
+
+
+def make_run_planner(max_tool_calls: int = 10) -> PlannerAgent:
+    """A planner wired for run(), with no config, client, or tools."""
+    planner = make_planner()
+    planner.model = "claude-test"
+    planner.max_tokens = 1024
+    planner.max_tool_calls = max_tool_calls
+    planner.tools = []
+    planner.web_tools = []
+    planner.web_search_enabled = False
+    planner.web_search_downgraded = False
+    return planner
+
+
+def run_with(planner: PlannerAgent, responses: list, content: str = "q") -> PlannerResult:
+    """Drive planner.run() over a scripted list of API responses."""
+    with patch.object(PlannerAgent, "_build_system_prompt", return_value=[]), \
+         patch.object(PlannerAgent, "_call_api", side_effect=list(responses)):
+        return planner.run(content, None, None, [], stream=False)
 
 
 def test_inspect_job_code_accepts_multiple_keys() -> None:
@@ -190,6 +259,74 @@ def test_tool_blocks_run_workflow_before_job_against_updated_yaml() -> None:
     assert "newCode();" in planner.current_yaml
 
 
+def test_pause_turn_keeps_the_text_from_before_the_pause() -> None:
+    planner = make_run_planner()
+    responses = [
+        FakeResponse("pause_turn", [FakeTextBlock("Half an answer. ")]),
+        FakeResponse("end_turn", [FakeTextBlock("The rest.")]),
+    ]
+
+    result = run_with(planner, responses)
+
+    assert result.response == "Half an answer. The rest."
+    assert result.history[-1]["content"] == "Half an answer. The rest."
+    assert [s["content"] for s in result.response_segments] == ["Half an answer. ", "The rest."]
+
+
+def test_paused_text_survives_the_max_tool_calls_exit_without_duplicating() -> None:
+    """Exiting the loop while still paused should keep the head exactly once."""
+    planner = make_run_planner(max_tool_calls=2)
+    responses = [
+        FakeResponse("pause_turn", [FakeTextBlock("A")]),
+        FakeResponse("pause_turn", [FakeTextBlock("B")]),
+    ]
+
+    result = run_with(planner, responses)
+
+    assert result.response == "AB"
+    # Pause rounds spend the same budget as real tool calls, so the loop stops.
+    assert result.meta["planner_iterations"] == planner.max_tool_calls
+
+
+def test_a_real_tool_round_resets_the_paused_text_buffer() -> None:
+    """Narration from before a tool call is not part of the final answer."""
+    planner = make_run_planner()
+    responses = [
+        FakeResponse("pause_turn", [FakeTextBlock("Stale narration. ")]),
+        FakeResponse("tool_use", [FakeToolUse("search_documentation", {"query": "dhis2"})]),
+        FakeResponse("end_turn", [FakeTextBlock("The real answer.")]),
+    ]
+
+    with patch("global_chat.planner.search_documentation_tool", return_value="docs"):
+        result = run_with(planner, responses)
+
+    assert result.response == "The real answer."
+
+
+def test_a_mixed_round_keeps_server_tool_blocks_in_history() -> None:
+    """A round with both a web search and a local tool should not drop the search blocks."""
+    planner = make_run_planner()
+    search_block = FakeServerToolUse("web_search", {"query": "dhis2 tracker api"})
+    responses = [
+        FakeResponse("tool_use", [search_block, FakeToolUse("search_documentation", {"query": "x"})]),
+        FakeResponse("end_turn", [FakeTextBlock("Done.")]),
+    ]
+    seen = []
+
+    def record_and_reply(_system: object, messages: list, _stream: object, _manager: object) -> FakeResponse:
+        seen.append(list(messages))
+        return responses.pop(0)
+
+    with patch.object(PlannerAgent, "_build_system_prompt", return_value=[]), \
+         patch.object(PlannerAgent, "_call_api", side_effect=record_and_reply), \
+         patch("global_chat.planner.search_documentation_tool", return_value="docs"):
+        planner.run("q", None, None, [], stream=False)
+
+    assistant_turn = seen[1][-2]
+    assert assistant_turn["role"] == "assistant"
+    assert search_block in assistant_turn["content"]
+
+
 def test_user_content_names_the_step_being_viewed() -> None:
     planner = make_planner()
 
@@ -206,3 +343,392 @@ def test_user_content_falls_back_to_page_for_non_step_pages() -> None:
 
     assert "workflows/my-wf/settings" in user_content
     assert "currently viewing the step" not in user_content
+
+
+class StubConfigLoader:
+    """Minimal ConfigLoader stand-in."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+
+
+class StubPromptLoader:
+    """ConfigLoader stand-in for _build_system_prompt, which only calls get_prompt."""
+
+    def __init__(self, **prompts: str) -> None:
+        self._prompts = prompts
+
+    def get_prompt(self, key: str) -> str:
+        return self._prompts.get(key, "")
+
+
+WEB_CONFIG = {
+    "planner": {
+        "model": "claude-opus",
+        "web_search": {
+            "max_uses": 5,
+            "max_content_tokens": 10000,
+            "allowed_domains": ["docs.dhis2.org"],
+        },
+    },
+}
+
+
+def build_planner(config: dict, *, web_search: bool) -> PlannerAgent:
+    """Construct a real PlannerAgent with the Anthropic client stubbed out."""
+    with patch("global_chat.planner.Anthropic"):
+        return PlannerAgent(StubConfigLoader(config), api_key="test-key", web_search=web_search)
+
+
+def test_web_tools_are_off_unless_the_request_asks_for_them() -> None:
+    planner = build_planner(WEB_CONFIG, web_search=False)
+
+    assert planner.web_tools == []
+    assert planner.web_search_enabled is False
+    assert planner.tools == TOOL_DEFINITIONS
+
+
+def test_web_tools_are_appended_after_the_existing_tools() -> None:
+    planner = build_planner(WEB_CONFIG, web_search=True)
+
+    assert planner.tools[: len(TOOL_DEFINITIONS)] == TOOL_DEFINITIONS
+    assert [t["name"] for t in planner.tools[len(TOOL_DEFINITIONS):]] == ["web_search", "web_fetch"]
+    assert planner.web_search_enabled is True
+
+
+def test_the_module_level_tool_list_is_never_mutated() -> None:
+    before = list(TOOL_DEFINITIONS)
+
+    build_planner(WEB_CONFIG, web_search=True)
+
+    assert before == TOOL_DEFINITIONS
+
+
+def test_an_empty_allowlist_keeps_the_tools_off_even_when_requested() -> None:
+    planner = build_planner({"planner": {"web_search": {"allowed_domains": []}}}, web_search=True)
+
+    assert planner.web_tools == []
+    assert planner.web_search_enabled is False
+
+
+def test_system_prompt_is_a_single_cached_block_without_web_tools() -> None:
+    planner = make_run_planner()
+    planner.config_loader = StubPromptLoader(planner_system_prompt="BASE PROMPT")
+
+    blocks = planner._build_system_prompt()
+
+    assert len(blocks) == 1
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_system_prompt_appends_an_uncached_web_block_with_the_allowlist() -> None:
+    planner = make_run_planner()
+    planner.config_loader = StubPromptLoader(
+        planner_system_prompt="BASE PROMPT",
+        planner_web_tools_prompt="WEB ADDENDUM {domains}",
+    )
+    planner.web_tools = build_web_tools(WEB_CONFIG)
+
+    blocks = planner._build_system_prompt()
+
+    # Two blocks, and only the first is cached: the addendum must stay after
+    # the breakpoint, outside the cache key.
+    assert [("cache_control" in block) for block in blocks] == [True, False]
+    assert blocks[0]["text"] == "BASE PROMPT"
+    assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[1]["text"] == "WEB ADDENDUM docs.dhis2.org"
+
+
+def test_the_web_tools_prompt_key_exists_in_prompts_yaml() -> None:
+    path = Path(planner_module.__file__).parent / "prompts.yaml"
+    prompts = yaml.safe_load(path.read_text(encoding="utf-8"))["prompts"]
+
+    assert "{domains}" in prompts["planner_web_tools_prompt"]
+
+
+def test_no_web_block_is_appended_when_the_prompt_is_missing() -> None:
+    """An empty text block would be rejected by the API, so drop it."""
+    planner = make_run_planner()
+    planner.config_loader = StubPromptLoader(planner_system_prompt="BASE PROMPT")
+    planner.web_tools = build_web_tools(WEB_CONFIG)
+
+    blocks = planner._build_system_prompt()
+
+    assert len(blocks) == 1
+
+
+class FakeEvent:
+    def __init__(self, event_type: str, **fields: object) -> None:
+        self.type = event_type
+        for key, value in fields.items():
+            setattr(self, key, value)
+
+
+class FakeBlockRef:
+    def __init__(self, block_type: str) -> None:
+        self.type = block_type
+
+
+class FakeStream:
+    def __init__(self, events: list, final: FakeResponse) -> None:
+        self._events = events
+        self._final = final
+
+    def __enter__(self) -> "FakeStream":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def get_final_message(self) -> FakeResponse:
+        return self._final
+
+
+class FakeMessages:
+    def __init__(self, stream: FakeStream) -> None:
+        self._stream = stream
+
+    def stream(self, **_kwargs: object) -> FakeStream:
+        return self._stream
+
+
+class FakeClient:
+    def __init__(self, stream: FakeStream) -> None:
+        self.messages = FakeMessages(stream)
+
+
+def block_start(block_type: str) -> FakeEvent:
+    return FakeEvent("content_block_start", content_block=FakeBlockRef(block_type))
+
+
+def text_delta(text: str) -> FakeEvent:
+    return FakeEvent("content_block_delta", delta=FakeEvent("text_delta", text=text))
+
+
+def test_server_tool_activity_spins_then_settles_once_per_round() -> None:
+    """Two server-tool uses in one round should result in one line."""
+    planner = make_run_planner()
+    final = FakeResponse("end_turn", [FakeTextBlock("Answer.")])
+    events = [
+        block_start("server_tool_use"),
+        block_start("web_search_tool_result"),
+        block_start("server_tool_use"),
+        block_start("web_fetch_tool_result"),
+        text_delta("Answer."),
+    ]
+    planner.client = FakeClient(FakeStream(events, final))
+    manager = StubStreamManager()
+
+    planner._call_api([], [], True, manager)
+
+    assert manager.thinking == [STATUS_SEARCHING_WEB, STATUS_SEARCHING_WEB]
+    assert manager.statuses == ["Searched the web"]
+    assert planner._segments == [{"type": "status", "content": "Searched the web"}]
+
+
+def test_the_spinner_uses_the_shared_web_status_pool() -> None:
+    planner = make_run_planner()
+    planner.client = FakeClient(FakeStream([block_start("server_tool_use")], FakeResponse("end_turn", [])))
+    manager = StubStreamManager()
+
+    planner._call_api([], [], True, manager)
+
+    assert manager.thinking == [STATUS_SEARCHING_WEB]
+
+
+def test_text_deltas_still_stream_alongside_the_new_branches() -> None:
+    planner = make_run_planner()
+    final = FakeResponse("end_turn", [FakeTextBlock("Hi there")])
+    planner.client = FakeClient(FakeStream([text_delta("Hi "), text_delta("there")], final))
+    manager = StubStreamManager()
+
+    planner._call_api([], [], True, manager)
+
+    assert manager.text == ["Hi ", "there"]
+
+
+class FakeSearchResult:
+    """A successful web_search_tool_result: content is a list."""
+
+    type = "web_search_tool_result"
+
+    def __init__(self) -> None:
+        self.content = [{"type": "web_search_result", "url": "https://docs.dhis2.org/a"}]
+
+
+class FakeSearchError:
+    """A failed web_search_tool_result: content is a bare object."""
+
+    type = "web_search_tool_result"
+
+    def __init__(self) -> None:
+        self.content = {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"}
+
+
+def test_meta_counts_searches_and_fetch_hostnames() -> None:
+    planner = make_run_planner()
+    planner.web_search_enabled = True
+    responses = [
+        FakeResponse("end_turn", [
+            FakeServerToolUse("web_search", {"query": "dhis2 tracker"}, block_id="s1"),
+            FakeSearchResult(),
+            FakeServerToolUse("web_fetch", {"url": "https://docs.dhis2.org/en/tracker.html?q=secret"}, block_id="f1"),
+            FakeServerToolUse("web_fetch", {"url": "https://docs.dhis2.org/en/events.html"}, block_id="f2"),
+            FakeTextBlock("Here is the shape."),
+        ]),
+    ]
+
+    result = run_with(planner, responses)
+
+    assert (result.meta["web_searches"], result.meta["web_fetches"]) == (1, 2)
+    # Hostnames only, deduplicated, and the ?q=secret query string is dropped.
+    assert result.meta["web_domains"] == ["docs.dhis2.org"]
+    assert result.meta["web_search_downgraded"] is False
+
+
+def test_meta_counting_survives_the_error_result_shape() -> None:
+    """A failed search returns content as an object. Counting
+    reads server_tool_use blocks and must not touch either shape."""
+    planner = make_run_planner()
+    planner.web_search_enabled = True
+    responses = [
+        FakeResponse("end_turn", [
+            FakeServerToolUse("web_search", {"query": "dhis2"}, block_id="s1"),
+            FakeSearchError(),
+            FakeTextBlock("Could not find it."),
+        ]),
+    ]
+
+    result = run_with(planner, responses)
+
+    assert result.meta["web_searches"] == 1
+    assert result.meta["web_fetches"] == 0
+    assert result.meta["web_domains"] == []
+
+
+def test_meta_sums_web_usage_across_rounds() -> None:
+    """A paused search continues into a second round; counts must accumulate."""
+    planner = make_run_planner()
+    planner.web_search_enabled = True
+    responses = [
+        FakeResponse("pause_turn", [
+            FakeServerToolUse("web_search", {"query": "dhis2"}, block_id="s1"),
+            FakeServerToolUse("web_fetch", {"url": "https://docs.dhis2.org/a.html"}, block_id="f1"),
+        ]),
+        FakeResponse("end_turn", [
+            FakeServerToolUse("web_fetch", {"url": "https://docs.dhis2.org/b.html"}, block_id="f2"),
+            FakeServerToolUse("web_fetch", {"url": "https://docs.openfn.org/c.html"}, block_id="f3"),
+            FakeTextBlock("Done."),
+        ]),
+    ]
+
+    result = run_with(planner, responses)
+
+    assert (result.meta["web_searches"], result.meta["web_fetches"]) == (1, 3)
+    assert result.meta["web_domains"] == ["docs.dhis2.org", "docs.openfn.org"]
+
+
+def test_meta_omits_the_web_fields_when_web_search_is_off() -> None:
+    planner = make_run_planner()
+    responses = [FakeResponse("end_turn", [FakeTextBlock("Plain answer.")])]
+
+    result = run_with(planner, responses)
+
+    assert "web_searches" not in result.meta
+    assert "web_search_downgraded" not in result.meta
+
+
+def make_bad_request(message: str = "web search is not enabled for this account") -> BadRequestError:
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return BadRequestError(message, response=httpx.Response(400, request=request), body=None)
+
+
+def test_a_bad_request_with_web_tools_retries_without_them() -> None:
+    planner = make_run_planner()
+    planner.web_tools = build_web_tools(WEB_CONFIG)
+    planner.tools = TOOL_DEFINITIONS + planner.web_tools
+    planner.web_search_enabled = True
+    planner.config_loader = StubPromptLoader(planner_system_prompt="BASE PROMPT")
+    tools_per_call = []
+
+    def fail_then_answer(_system: object, _messages: object, _stream: object, _manager: object) -> FakeResponse:
+        tools_per_call.append([t.get("name") for t in planner.tools])
+        if len(tools_per_call) == 1:
+            raise make_bad_request()
+        return FakeResponse("end_turn", [FakeTextBlock("Answered without the web.")])
+
+    with patch.object(PlannerAgent, "_call_api", side_effect=fail_then_answer):
+        result = planner.run("q", None, None, [], stream=False)
+
+    # Two calls, first with the web tools, the retry without.
+    assert [("web_search" in names) for names in tools_per_call] == [True, False]
+    assert result.response == "Answered without the web."
+    assert result.meta["web_search_downgraded"] is True
+    assert result.response_segments[0] == {
+        "type": "status",
+        "content": "Web search is unavailable for this account — answering without it",
+    }
+
+
+def test_the_downgrade_rebuilds_the_system_prompt_without_the_web_block() -> None:
+    """Otherwise the prompt still advertises two tools that are no longer sent."""
+    planner = make_run_planner()
+    planner.web_tools = build_web_tools(WEB_CONFIG)
+    planner.tools = TOOL_DEFINITIONS + planner.web_tools
+    planner.web_search_enabled = True
+    planner.config_loader = StubPromptLoader(
+        planner_system_prompt="BASE PROMPT",
+        planner_web_tools_prompt="WEB ADDENDUM {domains}",
+    )
+    systems = []
+
+    def fail_then_answer(system: list, _messages: object, _stream: object, _manager: object) -> FakeResponse:
+        systems.append([block["text"] for block in system])
+        if len(systems) == 1:
+            raise make_bad_request()
+        return FakeResponse("end_turn", [FakeTextBlock("Answered without the web.")])
+
+    with patch.object(PlannerAgent, "_call_api", side_effect=fail_then_answer):
+        planner.run("q", None, None, [], stream=False)
+
+    # The first call carries the addendum, and the retry should not.
+    assert systems == [["BASE PROMPT", "WEB ADDENDUM docs.dhis2.org"], ["BASE PROMPT"]]
+
+
+def test_a_bad_request_without_web_tools_is_not_retried() -> None:
+    planner = make_run_planner()
+    calls = []
+
+    def always_fail(*_args: object) -> FakeResponse:
+        calls.append(1)
+        raise make_bad_request("prompt is too long")
+
+    with patch.object(PlannerAgent, "_build_system_prompt", return_value=[]), \
+         patch.object(PlannerAgent, "_call_api", side_effect=always_fail), \
+         pytest.raises(ApolloError):
+        planner.run("q", None, None, [], stream=False)
+
+    assert calls == [1]
+
+
+def test_a_second_bad_request_surfaces_the_original_error() -> None:
+    planner = make_run_planner()
+    planner.web_tools = build_web_tools(WEB_CONFIG)
+    planner.tools = TOOL_DEFINITIONS + planner.web_tools
+    planner.web_search_enabled = True
+    planner.config_loader = StubPromptLoader(planner_system_prompt="BASE PROMPT")
+    errors = [make_bad_request("web search is not enabled"), make_bad_request("something else")]
+
+    def always_fail(*_args: object) -> FakeResponse:
+        raise errors.pop(0)
+
+    with patch.object(PlannerAgent, "_call_api", side_effect=always_fail), \
+         pytest.raises(ApolloError) as excinfo:
+        planner.run("q", None, None, [], stream=False)
+
+    assert errors == []
+    assert "web search is not enabled" in excinfo.value.message
+    assert "something else" not in excinfo.value.message

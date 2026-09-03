@@ -40,7 +40,8 @@ This document defines the input and output payload structure for the Global Agen
   ],
 
   "options": {                            // Runtime options (optional)
-    "stream": false
+    "stream": false,
+    "web_search": false
   },
 
   "api_key": "string (REQUIRED in production, optional in development)"
@@ -75,6 +76,7 @@ This document defines the input and output payload structure for the Global Agen
 
 - **`options`** (object, optional): Runtime options.
   - **`stream`** (boolean): Enable streaming response (default: false).
+  - **`web_search`** (boolean): Let the planner search and fetch pages on the live web for this request (default: `false`). Takes effect **only on planner-routed requests** — the direct `workflow_agent` / `job_code_agent` routes ignore it, and `meta.web_search_requested` records when it was set on a request that never reached the planner. Reachable domains are limited to a server-side allowlist. Requires the caller's own Anthropic key to have web search enabled in their Anthropic Console; searches bill to that key, and clients on a zero-data-retention contract cannot use it. If the key does not have it enabled, the turn still answers — without web results — and sets `meta.web_search_downgraded`.
 
 - **`api_key`** (string, **required in production**, optional in development): API key for the Anthropic API. In production environments this field is required and requests without it will be rejected. In development, the server falls back to the `ANTHROPIC_API_KEY` environment variable if this field is omitted.
 
@@ -124,7 +126,16 @@ This document defines the input and output payload structure for the Global Agen
       { "tool": "call_workflow_agent", "input": { "message": "..." } }
     ],
     "subagent_calls": [],                // Raw sub-agent result dicts (for debugging)
-    "total_tool_calls": 2
+    "total_tool_calls": 2,
+
+    // Only when options.web_search was set:
+    "web_search_requested": true,
+
+    // Only when the planner has web tools on:
+    "web_searches": 2,
+    "web_fetches": 1,
+    "web_domains": ["docs.dhis2.org"],
+    "web_search_downgraded": false
   }
 }
 ```
@@ -161,6 +172,10 @@ Each tool beat streams as: `thinking` spinner → `changes` (if the workflow was
   - **`tool_calls`** (array): List of `{tool, input}` objects for each tool the planner invoked (planner path only).
   - **`subagent_calls`** (array): Raw sub-agent result dicts including `_call_metadata` (planner path only, useful for debugging).
   - **`total_tool_calls`** (number): Total number of tool calls made by the planner (planner path only).
+  - **`web_search_requested`** (boolean): Present and `true` only when the request set `options.web_search`.
+  - **`web_searches`** / **`web_fetches`** (number): Server-side web search and web fetch calls the planner made this turn.
+  - **`web_domains`** (array): Hostnames the planner fetched from this turn, deduplicated.
+  - **`web_search_downgraded`** (boolean): `true` when the web tools were dropped mid-turn because the caller's Anthropic key rejected them, and the turn was answered without web results.
 
 ---
 

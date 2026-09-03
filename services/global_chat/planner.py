@@ -3,11 +3,12 @@ Planner Agent - Coordinates tools and subagents for complex multi-step tasks.
 """
 
 import os
+from urllib.parse import urlparse
 from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import httpx
-from anthropic import Anthropic
+from anthropic import Anthropic, BadRequestError
 import sentry_sdk
 
 import sys
@@ -22,10 +23,11 @@ from streaming_util import (
     STATUS_REVIEWING_WORKFLOW,
     STATUS_NEW_WORKFLOW,
     STATUS_PLANNING,
+    STATUS_SEARCHING_WEB,
 )
 from global_chat.config_loader import ConfigLoader
 from models import resolve_model
-from global_chat.tools.tool_definitions import TOOL_DEFINITIONS
+from global_chat.tools.tool_definitions import TOOL_DEFINITIONS, build_web_tools
 from yaml_utils import stitch_job_code, redact_job_bodies, find_job_in_yaml, get_step_name_from_page, inspect_job_code
 from tools.search_documentation.search_documentation import search_documentation_tool
 from global_chat.subagent_caller import call_workflow_agent, call_job_agent, format_subagent_result_for_llm
@@ -50,7 +52,12 @@ class PlannerAgent:
     Planner agent that coordinates subagents and tools for complex multi-step tasks.
     """
 
-    def __init__(self, config_loader: ConfigLoader, api_key: Optional[str] = None):
+    def __init__(
+        self,
+        config_loader: ConfigLoader,
+        api_key: Optional[str] = None,
+        web_search: bool = False,
+    ):
         self.config_loader = config_loader
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
 
@@ -58,7 +65,14 @@ class PlannerAgent:
             raise ApolloError(500, "ANTHROPIC_API_KEY not found")
 
         self.client = Anthropic(api_key=self.api_key)
-        self.tools = TOOL_DEFINITIONS
+
+        self.web_tools = build_web_tools(config_loader.config) if web_search else []
+        self.web_search_enabled = bool(self.web_tools)
+        self.web_search_downgraded = False
+        self.tools = TOOL_DEFINITIONS + self.web_tools
+
+        if web_search and not self.web_tools:
+            logger.info("web_search requested but no allowed_domains configured, web tools are disabled")
 
         planner_config = config_loader.config.get("planner", {})
         self.model = resolve_model(planner_config.get("model", "claude-opus"))
@@ -126,6 +140,8 @@ class PlannerAgent:
 
         tool_call_count = 0
         tool_calls_meta = []
+        paused_text = ""
+        web_usage = {"web_searches": 0, "web_fetches": 0, "web_domains": []}
         total_usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -136,7 +152,26 @@ class PlannerAgent:
         try:
             while tool_call_count < self.max_tool_calls:
                 try:
-                    response = self._call_api(system_prompt, messages, stream, stream_manager)
+                    try:
+                        response = self._call_api(system_prompt, messages, stream, stream_manager)
+                    except BadRequestError as web_error:
+                        # Likeliest cause is a caller whose Anthropic key does
+                        # not have web search enabled.
+                        if not self.web_tools:
+                            raise
+                        logger.warning(f"BadRequestError with the web tools active, retrying without them: {web_error}")
+                        self.web_tools = []
+                        self.tools = TOOL_DEFINITIONS
+                        self.web_search_downgraded = True
+                        system_prompt = self._build_system_prompt()
+                        self._send_settled(
+                            stream_manager,
+                            "Web search is unavailable for this account — answering without it",
+                        )
+                        try:
+                            response = self._call_api(system_prompt, messages, stream, stream_manager)
+                        except BadRequestError:
+                            raise web_error from None
 
                     for field in [
                         "input_tokens",
@@ -145,6 +180,13 @@ class PlannerAgent:
                         "cache_read_input_tokens",
                     ]:
                         total_usage[field] += getattr(response.usage, field, 0)
+
+                    round_web = self._count_server_tool_uses(response)
+                    web_usage["web_searches"] += round_web["web_searches"]
+                    web_usage["web_fetches"] += round_web["web_fetches"]
+                    for host in round_web["web_domains"]:
+                        if host not in web_usage["web_domains"]:
+                            web_usage["web_domains"].append(host)
 
                     logger.info(f"Claude API call {tool_call_count + 1}: stop_reason={response.stop_reason}")
 
@@ -172,25 +214,19 @@ class PlannerAgent:
                             tool_use_blocks, stream_manager, total_usage, tool_calls_meta
                         )
 
-                        content_blocks = []
-                        for block in response.content:
-                            if block.type == "thinking":
-                                content_blocks.append({
-                                    "type": "thinking",
-                                    "thinking": block.thinking,
-                                    "signature": block.signature,
-                                })
-                            elif block.type == "text":
-                                content_blocks.append({"type": "text", "text": block.text})
-                            elif block.type == "tool_use":
-                                content_blocks.append(
-                                    {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
-                                )
-
-                        messages.append({"role": "assistant", "content": content_blocks})
+                        # Append the response's own blocks rather than a whitelist of known types
+                        messages.append({"role": "assistant", "content": response.content})
                         messages.append({"role": "user", "content": tool_results})
 
                         tool_call_count += len(tool_use_blocks)
+                        paused_text = ""
+
+                    elif response.stop_reason == "pause_turn":
+                        messages.append({"role": "assistant", "content": response.content})
+                        paused_text += round_text
+                        round_text = ""
+                        tool_call_count += 1
+                        continue
 
                     else:
                         logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
@@ -215,7 +251,9 @@ class PlannerAgent:
         # response and history keep only the last round's text (the actual
         # answer), matching the direct routes and what was saved before
         # narration was streamed. The narration survives in response_segments.
-        final_text = round_text
+        # This does not apply to paused_text, a pause_turn round is the same answer
+        # the server split, so its head belongs to the final text.
+        final_text = paused_text + round_text
 
         if not final_text:
             stop_reason = getattr(response, "stop_reason", None)
@@ -255,19 +293,25 @@ class PlannerAgent:
         return_history.append({"role": "user", "content": content})
         return_history.append({"role": "assistant", "content": final_text})
 
+        meta = {
+            "agents": agents_used,
+            "planner_iterations": tool_call_count,
+            "tool_calls": tool_calls_meta,
+            "subagent_calls": self.subagent_results,
+            "total_tool_calls": tool_call_count,
+        }
+
+        if self.web_search_enabled:
+            meta.update(web_usage)
+            meta["web_search_downgraded"] = self.web_search_downgraded
+
         return PlannerResult(
             response=final_text,
             response_segments=response_segments,
             attachments=attachments,
             history=return_history,
             usage=total_usage,
-            meta={
-                "agents": agents_used,
-                "planner_iterations": tool_call_count,
-                "tool_calls": tool_calls_meta,
-                "subagent_calls": self.subagent_results,
-                "total_tool_calls": tool_call_count,
-            },
+            meta=meta,
         )
 
     def _build_user_content(self, content: str, page: Optional[str]) -> str:
@@ -306,6 +350,7 @@ class PlannerAgent:
         task-specific status messages sent before each tool execution.
         """
         if stream:
+            settled_this_round = False
             with self.client.messages.stream(
                 model=self.model,
                 max_tokens=self.max_tokens,
@@ -318,6 +363,13 @@ class PlannerAgent:
                 for event in stream_obj:
                     if event.type == "content_block_delta" and event.delta.type == "text_delta":
                         stream_manager.send_text(event.delta.text)
+                    elif event.type == "content_block_start":
+                        block_type = event.content_block.type
+                        if block_type == "server_tool_use":
+                            self._send_spinner(stream_manager, STATUS_SEARCHING_WEB)
+                        elif block_type in ("web_search_tool_result", "web_fetch_tool_result") and not settled_this_round:
+                            self._send_settled(stream_manager, "Searched the web")
+                            settled_this_round = True
                 return stream_obj.get_final_message()
         else:
             response = self.client.beta.messages.create(
@@ -760,8 +812,35 @@ class PlannerAgent:
         """Extract text from response content, concatenated as it was streamed."""
         return "".join(block.text for block in response.content if block.type == "text")
 
+    @staticmethod
+    def _count_server_tool_uses(response) -> dict:
+        """Count web search/fetch uses in one response and note fetched hosts."""
+        searches = 0
+        fetches = 0
+        hosts: list[str] = []
+
+        for block in response.content:
+            if getattr(block, "type", None) != "server_tool_use":
+                continue
+            if block.name == "web_search":
+                searches += 1
+            elif block.name == "web_fetch":
+                fetches += 1
+                host = urlparse((block.input or {}).get("url", "")).hostname
+                if host and host not in hosts:
+                    hosts.append(host)
+
+        return {"web_searches": searches, "web_fetches": fetches, "web_domains": hosts}
+
     def _build_system_prompt(self) -> list:
         """Build system prompt for planner with cache control."""
         prompt_text = self.config_loader.get_prompt("planner_system_prompt")
 
-        return [{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemeral"}}]
+        blocks = [{"type": "text", "text": prompt_text, "cache_control": {"type": "ephemeral"}}]
+
+        web_prompt = self.config_loader.get_prompt("planner_web_tools_prompt")
+        if self.web_tools and web_prompt:
+            domains = ", ".join(self.web_tools[0].get("allowed_domains") or [])
+            blocks.append({"type": "text", "text": web_prompt.replace("{domains}", domains)})
+
+        return blocks
